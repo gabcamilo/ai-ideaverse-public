@@ -82,8 +82,16 @@ llm-wiki/                        ← its own git repository
 ├── technologies/                ← concrete tech (tree-sitter.md, sqlite-fts5.md, ...)
 ├── patterns/                    ← recurring designs (index-first-retrieval.md, ...)
 ├── people/                      ← people and orgs (karpathy.md, nous-research.md, ...)
+├── gold/                        ← questions.yaml: question → expected pages (v0.5)
 └── scripts/
-    └── wikiq.(js|ts)            ← Path B deterministic scorer
+    ├── wikiq.mjs                ← Path B deterministic scorer (also imported by push-injection)
+    ├── validate-index.mjs       ← V1–V8 invariant checks (pre-commit + micro-lint)
+    ├── inject-context.mjs       ← gated UserPromptSubmit push-injection (v0.5)
+    ├── log-access.mjs           ← telemetry hook logger (v0.5)
+    ├── append-health.mjs        ← health.csv appender
+    ├── check-origins.mjs        ← origin liveness HEAD checks (cron wrapper, never the lint agent)
+    ├── build-dashboard.mjs      ← governance projection generator (v0.6)
+    └── install-hooks.sh / cron-deep-lint.sh
 ```
 
 No `log.md`. Git history is the audit log: every Ingest, Lint, and Deepen run ends in a structured commit (see §8.5). The `sources:` section of `_index.yaml` provides the cheap "what has been ingested" lookup that git history alone would make expensive.
@@ -135,6 +143,7 @@ Revalidation semantics are adopted from the owner's kb plugin: a page is **stale
 - Fixed heading vocabulary per page type, defined in `WIKI.md` (e.g., Solution pages: `## What it is`, `## Problem it solves`, `## How it works`, `## Relationships`, `## Assessment`). Stable headings make anchors durable and grep predictable.
 - Every entity mention that has a wiki page or index alias is a markdown link on first mention per section.
 - Each page ends with a `## Relationships` section: typed outbound links in the form `- uses → [[technologies/sqlite-fts5]]`, `- alternative-to → [[solutions/gbrain]]`. This is the traversable edge list — the wiki's lightweight knowledge graph, in the Graphify/GBrain spirit but at zero extra infrastructure.
+- **Tiered attribution.** Ordinary synthesis inherits the page's `sources` frontmatter silently. Quantitative claims, benchmark figures, and any claim that survived a contradiction adjudication carry an inline footnote-style key (`[^source-id]`) resolving to the page's `sources[]` list — machine-parseable, validator-checked, and queryable by lint ("all claims from source X"). Provenance precision only where numbers or disagreement make it load-bearing.
 - No decorative bullets, no images, no mermaid in wiki pages (those belong to human-facing artifacts; distillates in `sources/` keep theirs).
 
 ## 6. The index: `_index.yaml`
@@ -158,8 +167,11 @@ sources:
   - id: qmd
     path: sources/qmd.md
     ingested: 2026-07-28
-    origin_urls: ["https://github.com/tobi/qmd"]
-    pages_touched: [qmd, sqlite-fts5, hybrid-search, mcp, ...]
+    origin_urls: ["https://github.com/tobi/qmd"]   # canonical copy lives in the distillate's frontmatter; validator keeps these equal
+    origin_status: alive          # alive | dead | moved | unverified — written by check-origins + Deepen, never by lint
+    last_verified: 2026-07-28
+    pages_touched: [qmd, sqlite-fts5, hybrid-search, mcp, ...]   # historical ingest snapshot
+    derived_pages: [qmd, sqlite-fts5, hybrid-search, mcp, ...]   # computed: pages whose frontmatter lists this source
 ```
 
 **Critical invariant (the load-bearing rule from the entire corpus):** the index is updated in the same operation as any page write. An index that drifts from reality silently destroys the retrieval layer's advantage. Micro-lint verifies index/filesystem agreement on every ingest.
@@ -172,7 +184,7 @@ Two parallel paths over the same index, run comparatively until data picks a win
 
 **Path B — deterministic scorer (`scripts/wikiq`).** A script in the brain.js spirit: strips the question to keywords → scores every index entry against `title + aliases + summary + keywords` without opening any file (inbound count as a boost factor) → returns the top-k ranked entries with paths and anchors. Claude then opens only the top scorer(s), reads the relevant section, follows at most one pointer, and answers. No model call occurs before the final answer step.
 
-A routing note in the Claude Code project `CLAUDE.md` makes the wiki path the default: *check `_index.yaml` (via wikiq when available) before any grep/glob over the wiki.*
+**Adoption is enforced by mechanism, not instruction (ADR-013).** A `UserPromptSubmit` hook runs wikiq against every prompt and injects the top-k index hits (id, path, one-line summary — index entries only, no pages opened) into context when the top score clears a relevance threshold; below the threshold, nothing is injected and the turn pays no token tax. Access telemetry hooks (`PreToolUse`/`PostToolUse` on Read/Grep/Glob over page directories) log actual retrieval behavior to `_reports/access-trace.jsonl` for the §10 metrics and lint anti-pattern detection. Consumer subagent definitions must carry an explicit wiki-consultation clause. A routing note in `CLAUDE.md` documents the mechanism and states the fallback rule: *check `_index.yaml` (via wikiq when available) before any grep/glob over the wiki.*
 
 **Expected dynamics, stated up front to keep the comparison honest:** while the wiki is small, Path A wins or ties (the whole index fits trivially in context — CodeGraph's floor effect). The decision signal is the trend as the wiki grows, not the day-one result.
 
@@ -186,19 +198,20 @@ Four operations. Each has a trigger, a bounded scope, a defined output, and a st
 
 ### 8.2 Query
 - **Trigger:** human asks a question in Claude Code.
-- **Steps:** Path A or B retrieval → synthesize answer from wiki pages (not raw sources) → if the answer is a *novel synthesis* not present on any page, file it back into the appropriate page(s) and commit (Karpathy's compounding rule). If the wiki cannot answer, say so explicitly — gap visibility over confident omission (GBrain's `think` principle) — and propose an ingest or deepen.
+- **Steps:** Path A or B retrieval under the **escalation budget** (ADR-014): open the top-scoring page first; each additional page may be opened only if the previous one failed to answer; soft ceiling of 5 pages per query, beyond which the justification must be recorded in the trace → synthesize answer from wiki pages (not raw sources) → if the answer is a *novel synthesis* not present on any page, file it back into the appropriate page(s) and commit (Karpathy's compounding rule). If the wiki cannot answer, say so explicitly — gap visibility over confident omission (GBrain's `think` principle) — log the no-answer event, and propose an ingest or deepen.
+- **Trace:** every query appends a record to `_reports/queries.jsonl`: question, ranked candidates, pages opened, pages cited in the answer, token cost. Cited ÷ opened is the per-query **utilization ratio** — the mechanical bloat detector.
 
 ### 8.3 Lint
 Two tiers:
 - **Micro-lint (every ingest, scoped to touched pages):** internal links resolve; index entries match files; frontmatter valid; `Relationships` sections bidirectional where required; heading vocabulary respected.
-- **Deep lint (scheduled):** whole-wiki pass — orphan pages (no inbound links), contradictions between pages, stale pages (revalidation queue, priority-ordered), promotion candidates (sections under link/weight pressure), index drift, alias collisions. Output is a dated report in `_reports/`.
+- **Deep lint (scheduled):** whole-wiki pass — orphan pages (no inbound links), contradictions between pages, stale pages (revalidation queue, priority-ordered), promotion candidates (sections under link/weight pressure), index drift, alias collisions. It also audits retrieval behavior from the §10 traces (ADR-014): *missed-retrieval* (a logged no-answer where an existing page plainly covers the question — corrective action targets index metadata: aliases, keywords, summary), *low-utilization* (aggregate cited÷opened ratio declining), *grep-first violations* and *ceiling-exceeded* queries (from the access trace). Output is a dated report in `_reports/`.
 
 **Auto-fix whitelist (deep lint may repair without asking):** broken internal links, index drift, missing reciprocal links, frontmatter mechanical errors.
 **Report-only (human decides):** contradictions, staleness resolutions (which claim wins), page merges/splits/promotions, deletions.
 
 ### 8.4 Deepen
 - **Trigger:** a query or lint finding needs detail the distillate discarded, or a stale page needs revalidation against its origin.
-- **Steps:** resolve the page's `sources` → follow `origin_urls` through the appropriate type adapter → extract the missing detail → update the page (and only pages justified by the new material) → commit. Deepen is also the mechanism Deep Lint uses to revalidate stale pages.
+- **Steps:** resolve the page's `sources` → follow `origin_urls` through the appropriate type adapter → extract the missing detail → update the page (and only pages justified by the new material) → record `origin_status` + `last_verified` on the touched sources-registry entries (Deepen runs are the human-triggered network context; liveness data accrues opportunistically) → commit. Deepen is also the mechanism Deep Lint uses to revalidate stale pages — via queued tasks, never autonomously (§14.3).
 
 ### 8.5 Commit convention
 
@@ -217,13 +230,19 @@ Git history + `_index.yaml`'s sources registry fully replace `log.md`.
 - **Deep lint:** scheduled weekly via cron running Claude Code headless (`claude -p "/wiki:lint --deep"`), report-first with the §8.3 whitelist. Cadence and autonomy widen only after the report history shows the auto-fixes are trustworthy.
 - **Slash commands** (Claude Code custom commands): `/wiki:ingest`, `/wiki:query`, `/wiki:lint [--deep]`, `/wiki:deepen <page>`, `/wiki:status`.
 
-## 10. Observability seed
+## 10. Observability
 
-Deep lint appends one row per run to `_reports/health.csv`: date, page count by type, total links, orphan count, stale count, average inbound per page, index size. Retrieval comparisons (when run) log tokens, wall time, and path used per question to `_reports/retrieval.csv`. Small now; this is the seed of a van der Hoeven-style vault-health layer, and the promotion detector (`inbound` counts) feeds off the same data.
+Two planes, one report directory (ADR-013, ADR-014):
 
-## 11. Deferred: retrieval evaluation harness *(future iteration, by decision)*
+**Wiki health (structure).** Deep lint appends one row per run to `_reports/health.csv`: date, page count by type, total links, orphan count, stale count, average inbound per page, index size — plus aggregate utilization ratio and miss-finding count.
 
-When activated: a fixed set of 10–15 real questions supplied by the owner, each answered via Path A and Path B, comparing token cost (`/context`), wall time, and answer correctness; re-run at milestones (every ~25 pages) and logged to `_reports/retrieval.csv`. The question set doubles as a schema stress test: any question unanswerable by traversing the taxonomy indicates a taxonomy defect. Until the harness exists, both paths remain available and informal observation guides preference.
+**Retrieval behavior (consumption).** `_reports/queries.jsonl` is the canonical per-query trace (question, candidates, opened, cited, tokens); `_reports/access-trace.jsonl` records every page-directory access from the telemetry hooks; `_reports/retrieval.csv` is retained only for milestone harness comparisons (§11). Together these answer the two consumption questions no health metric can: *is the wiki actually being used*, and *is each query reading just enough* — bloat detected via the utilization ratio without any ground truth, misses detected via the no-answer audit and, from v0.5, the gold question set.
+
+This is the van der Hoeven-style observability layer, arrived at incrementally; the promotion detector (`inbound` counts) and the self-tuning index loop (miss finding → metadata enrichment) both feed off the same data.
+
+## 11. Retrieval evaluation harness *(tooling deferred; gold set scheduled — ADR-011 as amended by ADR-014)*
+
+The **gold question set** is authored by the owner at v0.5 in the upgraded format *question → expected pages* (10–15 real questions, each listing the page ids a correct retrieval should surface), making it a direct recall instrument rather than only an answer-quality check. Harness runner tooling remains deferred: when activated, each question is answered via Path A and Path B, comparing token cost, wall time, answer correctness, and retrieval recall against the expected pages; re-run at milestones (every ~25 pages) and logged to `_reports/retrieval.csv`. The question set doubles as a schema stress test: any question unanswerable by traversing the taxonomy indicates a taxonomy defect. Until the harness runs, the §10 traces (utilization ratio, miss audit) provide continuous proxy measurement.
 
 ## 12. Roadmap
 
@@ -235,12 +254,16 @@ When activated: a fixed set of 10–15 real questions supplied by the owner, eac
 
 **v0.4 — Deepen.** Wire type adapters for the deepen path; run first revalidation cycle on high-volatility Solution pages.
 
+**v0.5 — Adoption & retrieval observability (ADR-013, ADR-014).** Gated push-injection hook; access telemetry hooks; query traces with utilization ratio and escalation budget; deep lint retrieval-behavior audits; owner authors the gold question set (question → expected pages).
+
+**v0.6 — Governance dashboard (ADR-015).** `build-dashboard.mjs` emitting a self-contained `dashboard.html` + `dashboard-data.json`: four panels (Pages, Sources, Operations, Automations) mapped from Jay E's layer model, with the consumption heat overlay from the v0.5 traces. Regenerated by every deep lint; `/wiki-status --visual`.
+
 **Future iterations (unordered backlog):**
-- Formal retrieval eval harness (§11) and a Path A/B decision.
+- Harness runner tooling over the v0.5 gold set (§11) and a Path A/B decision.
 - `wiki_hints` emission in solution-sumarizer.
 - Semantic search tier: QMD-style local hybrid search over the wiki, exposed via MCP — added only if/when index+scorer retrieval degrades with scale.
-- Consumer lenses (`*-reference.md` views) as real consumers appear.
-- Ideaverse bridge: a human-oriented lens or sync surfacing wiki knowledge inside the Obsidian vault; direction and mechanism to be designed when the wiki is mature enough to be worth bridging.
+- Consumer lenses (`*-reference.md` views) as real consumers appear. When a human-facing lens materializes, diagrams are **generated projections, never stored content**: rendered on demand from each page's `## Relationships` edge lists via the mermaid-diagram skill (see References, item 14), shown, then discarded — the ADR-015 read-only-projection philosophy applied to diagrams, drift-proof because nothing persistent exists to drift. Mermaid remains banned from wiki pages (§5.3); distillate-side diagram conventions are a solution-sumarizer concern, outside this module's boundary.
+- **ai-ideaverse umbrella features** (sibling modules, not wiki features): llm-wiki is one module of the owner's broader **ai-ideaverse** project, alongside the Obsidian Ideaverse PKM vault and future full-workspace tooling. The workspace-level governance surface (Jay E's full audit: all MCP connectors, routines, skills across the whole Claude Code setup) and the wiki↔vault bridge live at umbrella level, composing data each module publishes (the wiki's contribution: `dashboard-data.json` and the index). Modules keep their truth boundaries; the umbrella aggregates. Each gets its own ADR when designed.
 - General-purpose knowledge domains beyond solutions research.
 
 ## 13. Decision log (from the design interview)
@@ -259,6 +282,10 @@ When activated: a fixed set of 10–15 real questions supplied by the owner, eac
 | 10 | kb plugin relationship | Independent project; reuses ideas (revalidation frontmatter, lens concept), free to diverge | Merge into kb; enforced shared conventions |
 | 11 | Eval harness | Deferred to future iteration | Build with v0.1 |
 | 12 | Scope | Solutions research now, extensible schema for growth | General-purpose from day one |
+| 13 | Wiki adoption | Gated push-injection (threshold-filtered wikiq on every prompt) + access telemetry + subagent clauses | Advisory instruction only; always-on injection; MCP-gated access |
+| 14 | Retrieval efficiency | Query traces, utilization ratio, escalation budget (soft ceiling 5), miss audit feeding index enrichment; gold set (question→expected-pages) authored at v0.5 | No measurement; full harness now; treating misses as scorer bugs first |
+| 15 | Governance dashboard | Generated read-only projection (`dashboard.html` + `dashboard-data.json`), wiki-scoped, four Jay E-mapped panels + consumption heat overlay, rebuilt by deep lint | Hand-maintained live dashboard; no visual layer; full-workspace scope inside this module (deferred to the ai-ideaverse umbrella) |
+| 16 | Provenance enforcement | Validator-checked chain (page→distillate→origin, V7) with computed `derived_pages`; tiered inline attribution keys for quantitative/adjudicated claims (V8); origin liveness via deterministic check-origins in the cron wrapper + opportunistic Deepen writes — lint agent stays networkless | Sentence-level citation everywhere; declared-but-unvalidated provenance; networked lint agent; liveness flags with no owner |
 
 ## 14. Open questions
 
@@ -266,3 +293,24 @@ When activated: a fixed set of 10–15 real questions supplied by the owner, eac
 2. The typed-relationship vocabulary for `## Relationships` sections (`uses`, `alternative-to`, `built-by`, `implements-pattern`, ...) — start minimal, let lint report unknown types.
 3. Whether Deep Lint's stale-page revalidation should be allowed to call Deepen autonomously (network access to origins) or only queue deepen tasks for human-triggered runs.
 4. wikiq implementation language (JS for zero-setup in Claude Code vs. TS) and its exact scoring function — decided at v0.2.
+
+---
+
+## 15. References
+
+Short names used throughout this specification (Karpathy, Jay E, QMD, GBrain, CodeGraph, Graphify, Hermes, Milo, van der Hoeven) resolve to the primary sources below. The project's `sources/` distillates are derived summaries and are not the citable sources.
+
+1. Andrej Karpathy — *LLM Wiki: A Pattern for Personal Knowledge Bases* (GitHub gist) — https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
+2. Jay E | RoboNuggets — *Build your Ultimate Second Brain with Claude Fable 5 (before it's too late)* (YouTube, 13:41) — https://www.youtube.com/watch?v=VoKiKvgpk78
+3. Tobi Lütke — *qmd (Query Markup Documents)* (GitHub) — https://github.com/tobi/qmd
+4. Garry Tan — *GBrain* (GitHub; analyzed via llms-full.txt) — https://github.com/garrytan/gbrain · https://raw.githubusercontent.com/garrytan/gbrain/master/llms-full.txt
+5. colbymchenry — *CodeGraph* (GitHub) — https://github.com/colbymchenry/codegraph
+6. Safi Shamsi / Graphify Labs — *Graphify* (GitHub) — https://github.com/graphify-labs/graphify
+7. Nous Research — *Hermes Agent* (GitHub + documentation) — https://github.com/nousresearch/hermes-agent · https://hermes-agent.nousresearch.com/docs/developer-guide/architecture
+8. Nick Milo (Linking Your Thinking) — *Create Your Digital Home: Obsidian Walkthrough* (Ideaverse for Obsidian; YouTube) — https://www.youtube.com/watch?v=bVl3IRGOWvk
+9. Nick Milo (Linking Your Thinking) — *This Secret Principle Will Transform Your Notes* (Architect & Gardener; PKM Summit NL 2025; YouTube) — https://www.youtube.com/watch?v=q0pQh69iPWA&list=PLw1ExsV_HfJ6r6I3VF-xeF4PtYiXA-8gF
+10. Nicole van der Hoeven — *Do Androids Dream of Second Brains?: Observability and AI for PKM* (PKM Summit Utrecht; YouTube, 43 min) — https://www.youtube.com/watch?v=BeuaPO0Ezuk
+11. Gabriela Camilo — *solution-sumarizer* (GitHub) — https://github.com/gabcamilo/solution-sumarizer
+12. Gabriela Camilo — *ai-ideaverse-public* (GitHub, public working-repo copy) — https://github.com/gabcamilo/ai-ideaverse-public
+13. Project owner — *AI Knowledge & Context Management: Six Concepts Compared* (internal research doc, 2026-07-22; adversarial ingest fixture C26) — its references resolve to items 1, 3–7 above.
+14. Gabriela Camilo — *mermaid-diagram* (GitHub; designated renderer for future human-lens diagram projections, §12) — https://github.com/gabcamilo/mermaid-diagram
