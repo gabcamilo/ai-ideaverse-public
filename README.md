@@ -1,1 +1,1 @@
-# agentic-ideaverse
+# ai-ideaverse
